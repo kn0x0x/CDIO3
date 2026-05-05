@@ -1,0 +1,6 @@
+indicator,type,tags,description
+50.16.16.211,ip,"c2;aws;feodo","AWS EC2 sample C2 for enrichment demo"
+CVE-2024-3400,cve,"kev;exploit;palo-alto","PAN-OS command injection demo IoC"
+http://payload-store.example-threat.net/update.exe,url,"urlhaus;malware;payload","Offline URLhaus-style payload URL"
+login-microsoft-verify.example-threat.net,domain,"phishing;credential;microsoft","Offline phishing domain"
+a1b2c3d4e5f678901234567890abcdef1234567890abcdef1234567890abcdef,hash,"lockbit;ransomware;hash","Offline MalwareBazaar-style hash"

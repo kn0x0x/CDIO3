@@ -1,0 +1,338 @@
+"""Scheduler — Runs all collectors periodically with APScheduler.
+
+Handles:
+- Periodic collection from all threat feed sources
+- Logging each run cycle (new IoCs, duplicates, errors)
+- Storing collected indicators into the database
+- Deduplication at insert time
+- Manual trigger via API
+
+Configuration via environment variables:
+- COLLECTOR_INTERVAL_MINUTES: How often to run (default: 30)
+- COLLECTOR_ENABLED: Set to "0" to disable auto-collection (default: "1")
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+from datetime import datetime, timezone
+from typing import Any, Optional
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from collectors import ALL_COLLECTORS
+from collectors.base_collector import BaseCollector, CollectedIndicator, CollectionResult
+
+logger = logging.getLogger("threatfeeds.scheduler")
+
+COLLECTOR_INTERVAL_MINUTES = int(os.getenv("COLLECTOR_INTERVAL_MINUTES", "30"))
+COLLECTOR_ENABLED = os.getenv("COLLECTOR_ENABLED", "1") == "1"
+
+
+class CollectorScheduler:
+    """Manages periodic collector runs and database ingestion."""
+
+    def __init__(self, session_factory: async_sessionmaker) -> None:
+        self._session_factory = session_factory
+        self._collectors: list[BaseCollector] = [cls() for cls in ALL_COLLECTORS]
+        self._running = False
+        self._task: Optional[asyncio.Task] = None
+        self._last_run: Optional[datetime] = None
+        self._last_results: list[dict[str, Any]] = []
+        self._run_count: int = 0
+
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
+    @property
+    def last_run(self) -> Optional[datetime]:
+        return self._last_run
+
+    @property
+    def last_results(self) -> list[dict[str, Any]]:
+        return self._last_results
+
+    @property
+    def run_count(self) -> int:
+        return self._run_count
+
+    @property
+    def next_run_in_seconds(self) -> Optional[float]:
+        if not self._last_run or not self._running:
+            return None
+        elapsed = (datetime.now(timezone.utc) - self._last_run).total_seconds()
+        remaining = (COLLECTOR_INTERVAL_MINUTES * 60) - elapsed
+        return max(0, remaining)
+
+    # --- Lifecycle -------------------------------------------------------
+    def start(self) -> None:
+        """Start the periodic collection loop."""
+        if not COLLECTOR_ENABLED:
+            logger.info("Collector scheduler DISABLED (COLLECTOR_ENABLED=0)")
+            return
+        if self._running:
+            logger.warning("Collector scheduler already running")
+            return
+
+        self._running = True
+        self._task = asyncio.create_task(self._loop())
+        logger.info(
+            "╔══════════════════════════════════════════════════╗\n"
+            "║  Collector Scheduler STARTED                    ║\n"
+            "║  Interval: every %d minutes                    ║\n"
+            "║  Collectors: %d active                          ║\n"
+            "╚══════════════════════════════════════════════════╝",
+            COLLECTOR_INTERVAL_MINUTES,
+            len(self._collectors),
+        )
+
+    def stop(self) -> None:
+        """Stop the periodic collection loop."""
+        self._running = False
+        if self._task:
+            self._task.cancel()
+            self._task = None
+        logger.info("Collector scheduler STOPPED")
+
+    # --- Main loop -------------------------------------------------------
+    async def _loop(self) -> None:
+        """Background loop — run collectors, then sleep."""
+        # Run immediately on first start
+        await self.run_all_collectors()
+
+        while self._running:
+            try:
+                logger.info(
+                    "⏳ Next collection in %d minutes...",
+                    COLLECTOR_INTERVAL_MINUTES,
+                )
+                await asyncio.sleep(COLLECTOR_INTERVAL_MINUTES * 60)
+
+                if self._running:
+                    await self.run_all_collectors()
+
+            except asyncio.CancelledError:
+                logger.info("Collector loop cancelled")
+                break
+            except Exception:
+                logger.exception("Unexpected error in collector loop")
+                await asyncio.sleep(60)  # Wait 1 min before retry
+
+    # --- Run all collectors ----------------------------------------------
+    async def run_all_collectors(self) -> list[dict[str, Any]]:
+        """Run all collectors concurrently and store results.
+
+        Returns a summary for each collector.
+        """
+        self._run_count += 1
+        run_id = self._run_count
+        started = datetime.now(timezone.utc)
+
+        logger.info(
+            "\n"
+            "╔══════════════════════════════════════════════════════════════╗\n"
+            "║  COLLECTION CYCLE #%d STARTED  at %s  ║\n"
+            "╚══════════════════════════════════════════════════════════════╝",
+            run_id,
+            started.strftime("%Y-%m-%d %H:%M:%S UTC"),
+        )
+
+        # Run all collectors concurrently
+        tasks = [collector.collect() for collector in self._collectors]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        summaries: list[dict[str, Any]] = []
+        total_new = 0
+        total_dupes = 0
+        total_errors = 0
+
+        for i, result in enumerate(results):
+            collector = self._collectors[i]
+
+            if isinstance(result, Exception):
+                logger.error(
+                    "  ✗ Collector '%s' raised exception: %s",
+                    collector.name,
+                    result,
+                )
+                summaries.append({
+                    "feed": collector.name,
+                    "success": False,
+                    "error": str(result),
+                    "indicators_collected": 0,
+                    "indicators_new": 0,
+                    "indicators_duplicate": 0,
+                })
+                total_errors += 1
+                continue
+
+            indicators, collection_result = result
+
+            # Store indicators in database
+            new_count, dupe_count = await self._store_indicators(
+                indicators, collector.name
+            )
+
+            collection_result.indicators_new = new_count
+            collection_result.indicators_duplicate = dupe_count
+            total_new += new_count
+            total_dupes += dupe_count
+            if not collection_result.success:
+                total_errors += 1
+
+            summary = {
+                "feed": collector.name,
+                "success": collection_result.success,
+                "indicators_collected": collection_result.indicators_collected,
+                "indicators_new": new_count,
+                "indicators_duplicate": dupe_count,
+                "duration_seconds": collection_result.duration_seconds,
+                "errors": collection_result.errors,
+            }
+            summaries.append(summary)
+
+            status_icon = "✓" if collection_result.success else "✗"
+            logger.info(
+                "  %s %-25s  collected=%d  new=%d  dupes=%d  time=%.1fs",
+                status_icon,
+                collector.name,
+                collection_result.indicators_collected,
+                new_count,
+                dupe_count,
+                collection_result.duration_seconds,
+            )
+
+        self._last_run = datetime.now(timezone.utc)
+        self._last_results = summaries
+        elapsed = (self._last_run - started).total_seconds()
+
+        logger.info(
+            "\n"
+            "╔══════════════════════════════════════════════════════════════╗\n"
+            "║  COLLECTION CYCLE #%d COMPLETED                            ║\n"
+            "║  Duration: %.1fs                                           ║\n"
+            "║  New IoCs: %d  |  Duplicates: %d  |  Errors: %d            ║\n"
+            "╚══════════════════════════════════════════════════════════════╝",
+            run_id,
+            elapsed,
+            total_new,
+            total_dupes,
+            total_errors,
+        )
+
+        return summaries
+
+    # --- Store indicators ------------------------------------------------
+    async def _store_indicators(
+        self, indicators: list[CollectedIndicator], feed_name: str
+    ) -> tuple[int, int]:
+        """Store collected indicators into the database.
+
+        Returns (new_count, duplicate_count).
+        Deduplicates by (indicator_type, indicator_value).
+        Links to existing Feed or creates one.
+        """
+        if not indicators:
+            return 0, 0
+
+        new_count = 0
+        dupe_count = 0
+
+        # Import here to avoid circular imports
+        from threatfeeds_backend import (
+            Alert, Feed, FeedStatus, Priority, now_utc
+        )
+
+        async with self._session_factory() as session:
+            # Find or create the feed
+            feed = await self._get_or_create_feed(session, feed_name, indicators[0])
+
+            for ind in indicators:
+                # Check for duplicate
+                existing = await session.execute(
+                    select(Alert).where(
+                        Alert.indicator_type == ind.indicator_type,
+                        Alert.indicator_value == ind.indicator_value,
+                        Alert.feed_id == feed.id,
+                    )
+                )
+                if existing.scalars().first():
+                    dupe_count += 1
+                    continue
+
+                # Map severity string to Priority enum
+                sev_map = {
+                    "low": Priority.low,
+                    "medium": Priority.medium,
+                    "high": Priority.high,
+                    "critical": Priority.critical,
+                }
+
+                alert = Alert(
+                    feed_id=feed.id,
+                    title=ind.title[:512],
+                    description=ind.description[:2000] if ind.description else None,
+                    indicator_type=ind.indicator_type,
+                    indicator_value=ind.indicator_value[:2048],
+                    severity=sev_map.get(ind.severity, Priority.medium),
+                    confidence=ind.confidence,
+                    tags=json.dumps(ind.tags, ensure_ascii=False) if ind.tags else None,
+                    published_at=now_utc(),
+                )
+                session.add(alert)
+                new_count += 1
+
+            # Update feed timestamp
+            feed.last_fetched_at = now_utc()
+            feed.updated_at = now_utc()
+
+            await session.commit()
+
+        return new_count, dupe_count
+
+    async def _get_or_create_feed(
+        self,
+        session: AsyncSession,
+        feed_name: str,
+        sample_indicator: CollectedIndicator,
+    ):
+        """Find existing feed by name or create a new one."""
+        from threatfeeds_backend import Feed, FeedStatus
+
+        result = await session.execute(
+            select(Feed).where(Feed.name == feed_name)
+        )
+        feed = result.scalars().first()
+
+        if not feed:
+            feed = Feed(
+                name=feed_name,
+                source_url=f"auto-collected://{feed_name.lower().replace(' ', '-')}",
+                description=f"Auto-created feed for {feed_name} collector",
+                status=FeedStatus.active,
+            )
+            session.add(feed)
+            await session.flush()
+            logger.info("  Created new feed: %s (id=%s)", feed_name, feed.id)
+
+        return feed
+
+    # --- Status ----------------------------------------------------------
+    def get_status(self) -> dict[str, Any]:
+        """Return current scheduler status for API."""
+        return {
+            "enabled": COLLECTOR_ENABLED,
+            "running": self._running,
+            "interval_minutes": COLLECTOR_INTERVAL_MINUTES,
+            "collector_count": len(self._collectors),
+            "collectors": [c.name for c in self._collectors],
+            "run_count": self._run_count,
+            "last_run": self._last_run.isoformat() if self._last_run else None,
+            "next_run_in_seconds": self.next_run_in_seconds,
+            "last_results": self._last_results,
+        }

@@ -1,0 +1,1188 @@
+"""Threat Feeds Backend — Full working source for frontend integration (threatfeeds.io).
+
+Run:
+  pip install -r requirements.txt
+  python threatfeeds_backend.py
+
+Server starts at http://localhost:8000
+Swagger docs at http://localhost:8000/docs
+
+Uses SQLite (aiosqlite) by default — zero config needed.
+Set DATABASE_URL env var for PostgreSQL in production.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import enum
+import json
+import logging
+import os
+import random
+from datetime import datetime, timedelta, timezone
+from typing import Any, AsyncGenerator, Optional
+from uuid import uuid4
+
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+from sqlalchemy import DateTime, Enum, Float, ForeignKey, String, Text, func, select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+# ============================================================================
+# Logging
+# ============================================================================
+logging.basicConfig(
+    level=logging.DEBUG if os.getenv("DEBUG", "1") == "1" else logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("threatfeeds")
+
+# ============================================================================
+# Config
+# ============================================================================
+APP_NAME = "Threat Feeds Backend"
+APP_VERSION = "1.0.0"
+DEFAULT_CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*")
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./threatfeeds.db")
+DEBUG_MODE = os.getenv("DEBUG", "1") == "1"
+
+if DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
+
+# ============================================================================
+# Database Models
+# ============================================================================
+class Base(DeclarativeBase):
+    pass
+
+
+class FeedStatus(str, enum.Enum):
+    active = "active"
+    inactive = "inactive"
+
+
+class Priority(str, enum.Enum):
+    low = "low"
+    medium = "medium"
+    high = "high"
+    critical = "critical"
+
+
+class Feed(Base):
+    __tablename__ = "feeds"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    name: Mapped[str] = mapped_column(String(255), index=True)
+    source_url: Mapped[str] = mapped_column(String(1024), unique=True, index=True)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    status: Mapped[FeedStatus] = mapped_column(Enum(FeedStatus, name="feed_status"), default=FeedStatus.active)
+    last_fetched_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc)
+    )
+
+    alerts: Mapped[list["Alert"]] = relationship(back_populates="feed", cascade="all, delete-orphan")
+
+
+class Alert(Base):
+    __tablename__ = "alerts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    feed_id: Mapped[str] = mapped_column(ForeignKey("feeds.id", ondelete="CASCADE"), index=True)
+    title: Mapped[str] = mapped_column(String(512), index=True)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    indicator_type: Mapped[str] = mapped_column(String(64), index=True)  # ip, domain, url, hash, email, cve, file
+    indicator_value: Mapped[str] = mapped_column(String(2048), index=True)
+    severity: Mapped[Priority] = mapped_column(Enum(Priority, name="priority"), default=Priority.medium)
+    confidence: Mapped[float] = mapped_column(Float, default=0.5)
+    tags: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON string
+    published_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+    feed: Mapped[Feed] = relationship(back_populates="alerts")
+
+
+# ============================================================================
+# Database engine & session
+# ============================================================================
+engine = create_async_engine(DATABASE_URL, echo=DEBUG_MODE, future=True)
+SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
+
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    async with SessionLocal() as session:
+        yield session
+
+
+# ============================================================================
+# Pydantic Schemas (request / response)
+# ============================================================================
+class APIResponse(BaseModel):
+    success: bool = True
+    message: str = "ok"
+    data: Any | None = None
+    meta: dict[str, Any] = Field(default_factory=dict)
+
+
+class FeedCreate(BaseModel):
+    name: str = Field(min_length=2, max_length=255)
+    source_url: str = Field(min_length=5, max_length=1024)
+    description: Optional[str] = None
+
+
+class FeedUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=2, max_length=255)
+    source_url: Optional[str] = Field(default=None, min_length=5, max_length=1024)
+    description: Optional[str] = None
+    status: Optional[FeedStatus] = None
+
+
+class FeedOut(BaseModel):
+    id: str
+    name: str
+    source_url: str
+    description: Optional[str]
+    status: FeedStatus
+    last_fetched_at: Optional[datetime]
+    created_at: datetime
+    updated_at: datetime
+    alert_count: int = 0
+
+    model_config = {"from_attributes": True}
+
+
+class AlertCreate(BaseModel):
+    feed_id: str
+    title: str = Field(min_length=3, max_length=512)
+    description: Optional[str] = None
+    indicator_type: str = Field(pattern="^(ip|domain|url|hash|email|cve|file)$")
+    indicator_value: str = Field(min_length=1, max_length=2048)
+    severity: Priority = Priority.medium
+    confidence: float = Field(ge=0.0, le=1.0, default=0.5)
+    tags: list[str] = Field(default_factory=list)
+
+
+class AlertUpdate(BaseModel):
+    title: Optional[str] = Field(default=None, min_length=3, max_length=512)
+    description: Optional[str] = None
+    severity: Optional[Priority] = None
+    confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    tags: Optional[list[str]] = None
+
+
+class AlertOut(BaseModel):
+    id: str
+    feed_id: str
+    feed_name: str = ""
+    title: str
+    description: Optional[str]
+    indicator_type: str
+    indicator_value: str
+    severity: Priority
+    confidence: float
+    tags: list[str] = Field(default_factory=list)
+    published_at: datetime
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class DashboardOut(BaseModel):
+    total_feeds: int
+    active_feeds: int
+    inactive_feeds: int
+    total_alerts: int
+    critical_alerts: int
+    high_alerts: int
+    medium_alerts: int
+    low_alerts: int
+    severity_breakdown: dict[str, int]
+    indicator_type_breakdown: dict[str, int]
+    latest_alerts: list[AlertOut]
+    recent_feeds: list[FeedOut]
+
+
+class SeverityStatsOut(BaseModel):
+    critical: int = 0
+    high: int = 0
+    medium: int = 0
+    low: int = 0
+    total: int = 0
+
+
+class IndicatorTypeStatsOut(BaseModel):
+    stats: dict[str, int] = Field(default_factory=dict)
+    total: int = 0
+
+
+# ============================================================================
+# FastAPI App
+# ============================================================================
+app = FastAPI(
+    title=APP_NAME,
+    version=APP_VERSION,
+    description="Threat intelligence feed aggregation API for threatfeeds.io frontend",
+    debug=DEBUG_MODE,
+    swagger_ui_parameters={"defaultModelsExpandDepth": -1},
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"] if DEFAULT_CORS_ORIGINS == "*" else [o.strip() for o in DEFAULT_CORS_ORIGINS.split(",")],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ============================================================================
+# Helpers
+# ============================================================================
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def serialize_tags(tags_raw: Optional[str]) -> list[str]:
+    if not tags_raw:
+        return []
+    try:
+        value = json.loads(tags_raw)
+        return value if isinstance(value, list) else []
+    except Exception:
+        return []
+
+
+def dump_feed(feed: Feed, alert_count: int = 0) -> FeedOut:
+    return FeedOut(
+        id=feed.id,
+        name=feed.name,
+        source_url=feed.source_url,
+        description=feed.description,
+        status=feed.status,
+        last_fetched_at=feed.last_fetched_at,
+        created_at=feed.created_at,
+        updated_at=feed.updated_at,
+        alert_count=alert_count,
+    )
+
+
+def dump_alert(alert: Alert, feed_name: str = "") -> AlertOut:
+    return AlertOut(
+        id=alert.id,
+        feed_id=alert.feed_id,
+        feed_name=feed_name,
+        title=alert.title,
+        description=alert.description,
+        indicator_type=alert.indicator_type,
+        indicator_value=alert.indicator_value,
+        severity=alert.severity,
+        confidence=alert.confidence,
+        tags=serialize_tags(alert.tags),
+        published_at=alert.published_at,
+        created_at=alert.created_at,
+    )
+
+
+# ============================================================================
+# Error handlers
+# ============================================================================
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "success": False,
+            "message": "Internal server error",
+            "error": str(exc) if DEBUG_MODE else "unexpected_error",
+        },
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "success": False,
+            "message": exc.detail,
+        },
+    )
+
+
+# ============================================================================
+# Startup — create tables & seed demo data
+# ============================================================================
+# Scheduler instance (created after app, used in startup/shutdown)
+collector_scheduler = None
+
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    global collector_scheduler
+    logger.info("=" * 60)
+    logger.info("  Starting %s v%s", APP_NAME, APP_VERSION)
+    logger.info("  Database: %s", DATABASE_URL.split("@")[-1] if "@" in DATABASE_URL else DATABASE_URL)
+    logger.info("  Debug: %s", DEBUG_MODE)
+    logger.info("=" * 60)
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    logger.info("Database tables created/verified")
+
+    await seed_demo_data()
+
+    # Start collector scheduler
+    from scheduler import CollectorScheduler
+    collector_scheduler = CollectorScheduler(SessionLocal)
+    collector_scheduler.start()
+
+    logger.info("Startup completed — server ready!")
+
+
+@app.on_event("shutdown")
+async def shutdown_event() -> None:
+    global collector_scheduler
+    if collector_scheduler:
+        collector_scheduler.stop()
+    logger.info("Shutdown completed")
+
+
+async def seed_demo_data() -> None:
+    """Seed rich demo data for frontend testing — only runs if DB is empty."""
+    async with SessionLocal() as session:
+        res = await session.execute(select(func.count(Feed.id)))
+        feed_count = res.scalar_one()
+        if feed_count > 0:
+            logger.info("Demo data already exists (%d feeds), skipping seed", feed_count)
+            return
+
+        logger.info("Seeding demo data...")
+
+        # --- Feeds ---
+        feeds_data = [
+            {
+                "name": "AlienVault OTX",
+                "source_url": "https://otx.alienvault.com/api/v1/pulses/subscribed",
+                "description": "Open Threat Exchange — community-driven threat intelligence",
+                "status": FeedStatus.active,
+            },
+            {
+                "name": "Abuse.ch URLhaus",
+                "source_url": "https://urlhaus-api.abuse.ch/v1/urls/recent/",
+                "description": "URLhaus tracks malicious URLs used for malware distribution",
+                "status": FeedStatus.active,
+            },
+            {
+                "name": "Feodo Tracker",
+                "source_url": "https://feodotracker.abuse.ch/downloads/ipblocklist.json",
+                "description": "Tracks Feodo/Dridex/Emotet/TrickBot C2 servers",
+                "status": FeedStatus.active,
+            },
+            {
+                "name": "PhishTank",
+                "source_url": "https://data.phishtank.com/data/online-valid.json",
+                "description": "Community-sourced phishing URL verification",
+                "status": FeedStatus.active,
+            },
+            {
+                "name": "CISA Known Exploited Vulnerabilities",
+                "source_url": "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
+                "description": "CISA catalog of known exploited CVEs",
+                "status": FeedStatus.active,
+            },
+            {
+                "name": "Blocklist.de",
+                "source_url": "https://lists.blocklist.de/lists/all.txt",
+                "description": "IP blocklist for SSH/mail/web attacks",
+                "status": FeedStatus.inactive,
+            },
+            {
+                "name": "MalwareBazaar",
+                "source_url": "https://bazaar.abuse.ch/export/json/recent/",
+                "description": "Malware sample sharing platform by abuse.ch",
+                "status": FeedStatus.active,
+            },
+        ]
+
+        feed_objs = []
+        for i, fd in enumerate(feeds_data):
+            feed = Feed(
+                name=fd["name"],
+                source_url=fd["source_url"],
+                description=fd["description"],
+                status=fd["status"],
+                last_fetched_at=now_utc() - timedelta(minutes=random.randint(5, 120)),
+            )
+            session.add(feed)
+            feed_objs.append(feed)
+
+        await session.flush()  # generate IDs
+
+        # --- Alerts ---
+        alerts_data = [
+            # AlienVault OTX alerts
+            {
+                "feed_idx": 0,
+                "title": "Suspicious C2 IP detected",
+                "description": "IP associated with APT29 (Cozy Bear) infrastructure",
+                "indicator_type": "ip",
+                "indicator_value": "185.199.108.153",
+                "severity": Priority.critical,
+                "confidence": 0.95,
+                "tags": '["apt29", "c2", "russia"]',
+            },
+            {
+                "feed_idx": 0,
+                "title": "Cobalt Strike beacon domain",
+                "description": "Domain hosting Cobalt Strike beacon payloads",
+                "indicator_type": "domain",
+                "indicator_value": "cdn-update.systemcheck[.]cloud",
+                "severity": Priority.critical,
+                "confidence": 0.98,
+                "tags": '["cobalt-strike", "c2", "beacon"]',
+            },
+            {
+                "feed_idx": 0,
+                "title": "Phishing email indicator",
+                "description": "Email address used in spearphishing campaign targeting finance sector",
+                "indicator_type": "email",
+                "indicator_value": "admin@secure-banking-login[.]com",
+                "severity": Priority.high,
+                "confidence": 0.88,
+                "tags": '["phishing", "finance", "spearphishing"]',
+            },
+            # Abuse.ch URLhaus alerts
+            {
+                "feed_idx": 1,
+                "title": "Emotet dropper URL",
+                "description": "URL distributing Emotet malware dropper via macro-enabled document",
+                "indicator_type": "url",
+                "indicator_value": "https://evil-download[.]xyz/invoice_2024.docm",
+                "severity": Priority.critical,
+                "confidence": 0.97,
+                "tags": '["emotet", "dropper", "malware"]',
+            },
+            {
+                "feed_idx": 1,
+                "title": "Redline Stealer download URL",
+                "description": "URL serving Redline Stealer info-stealer binary",
+                "indicator_type": "url",
+                "indicator_value": "http://files.malhost[.]top/setup_v3.2.1.exe",
+                "severity": Priority.high,
+                "confidence": 0.91,
+                "tags": '["redline", "infostealer", "download"]',
+            },
+            # Feodo Tracker alerts
+            {
+                "feed_idx": 2,
+                "title": "TrickBot C2 server",
+                "description": "Active TrickBot command and control server",
+                "indicator_type": "ip",
+                "indicator_value": "45.33.32.156",
+                "severity": Priority.high,
+                "confidence": 0.89,
+                "tags": '["trickbot", "c2", "botnet"]',
+            },
+            {
+                "feed_idx": 2,
+                "title": "Dridex C2 node",
+                "description": "Dridex banking trojan C2 communication endpoint",
+                "indicator_type": "ip",
+                "indicator_value": "198.51.100.42",
+                "severity": Priority.high,
+                "confidence": 0.85,
+                "tags": '["dridex", "banking-trojan", "c2"]',
+            },
+            # PhishTank alerts
+            {
+                "feed_idx": 3,
+                "title": "PayPal phishing page",
+                "description": "Credential harvesting page mimicking PayPal login",
+                "indicator_type": "url",
+                "indicator_value": "https://paypa1-secure[.]com/login/verify",
+                "severity": Priority.medium,
+                "confidence": 0.93,
+                "tags": '["phishing", "paypal", "credential-theft"]',
+            },
+            {
+                "feed_idx": 3,
+                "title": "Microsoft 365 phishing",
+                "description": "Fake Microsoft 365 login page collecting enterprise credentials",
+                "indicator_type": "domain",
+                "indicator_value": "microsoft365-auth[.]net",
+                "severity": Priority.high,
+                "confidence": 0.96,
+                "tags": '["phishing", "microsoft", "enterprise"]',
+            },
+            # CISA KEV alerts
+            {
+                "feed_idx": 4,
+                "title": "CVE-2024-3400 PAN-OS Command Injection",
+                "description": "Critical command injection in Palo Alto Networks PAN-OS GlobalProtect",
+                "indicator_type": "cve",
+                "indicator_value": "CVE-2024-3400",
+                "severity": Priority.critical,
+                "confidence": 1.0,
+                "tags": '["cve", "palo-alto", "command-injection", "kev"]',
+            },
+            {
+                "feed_idx": 4,
+                "title": "CVE-2024-21887 Ivanti Connect Secure",
+                "description": "Authentication bypass in Ivanti Connect Secure VPN appliance",
+                "indicator_type": "cve",
+                "indicator_value": "CVE-2024-21887",
+                "severity": Priority.critical,
+                "confidence": 1.0,
+                "tags": '["cve", "ivanti", "auth-bypass", "kev"]',
+            },
+            # MalwareBazaar alerts
+            {
+                "feed_idx": 6,
+                "title": "LockBit 3.0 ransomware sample",
+                "description": "SHA-256 hash of confirmed LockBit 3.0 ransomware binary",
+                "indicator_type": "hash",
+                "indicator_value": "a1b2c3d4e5f678901234567890abcdef1234567890abcdef1234567890abcdef",
+                "severity": Priority.critical,
+                "confidence": 0.99,
+                "tags": '["lockbit", "ransomware", "hash"]',
+            },
+            {
+                "feed_idx": 6,
+                "title": "AgentTesla keylogger",
+                "description": "Malicious file hash associated with AgentTesla keylogger variant",
+                "indicator_type": "file",
+                "indicator_value": "invoice_march_2024.exe",
+                "severity": Priority.medium,
+                "confidence": 0.82,
+                "tags": '["agenttesla", "keylogger", "trojan"]',
+            },
+            {
+                "feed_idx": 6,
+                "title": "AsyncRAT payload hash",
+                "description": "Known hash for AsyncRAT remote access trojan payload",
+                "indicator_type": "hash",
+                "indicator_value": "deadbeefcafebabe0123456789abcdef0123456789abcdef0123456789abcdef",
+                "severity": Priority.high,
+                "confidence": 0.87,
+                "tags": '["asyncrat", "rat", "remote-access"]',
+            },
+            # Low severity / noise
+            {
+                "feed_idx": 0,
+                "title": "Suspicious DNS query pattern",
+                "description": "Unusual DNS query pattern potentially indicative of DNS tunneling",
+                "indicator_type": "domain",
+                "indicator_value": "data.exfil-tunnel[.]xyz",
+                "severity": Priority.low,
+                "confidence": 0.45,
+                "tags": '["dns-tunneling", "suspicious", "low-confidence"]',
+            },
+            {
+                "feed_idx": 1,
+                "title": "Potentially unwanted program URL",
+                "description": "URL distributing adware/PUP software bundle",
+                "indicator_type": "url",
+                "indicator_value": "http://free-download-tools[.]com/bundle.exe",
+                "severity": Priority.low,
+                "confidence": 0.55,
+                "tags": '["pup", "adware", "low-risk"]',
+            },
+        ]
+
+        for i, ad in enumerate(alerts_data):
+            alert = Alert(
+                feed_id=feed_objs[ad["feed_idx"]].id,
+                title=ad["title"],
+                description=ad["description"],
+                indicator_type=ad["indicator_type"],
+                indicator_value=ad["indicator_value"],
+                severity=ad["severity"],
+                confidence=ad["confidence"],
+                tags=ad["tags"],
+                published_at=now_utc() - timedelta(minutes=random.randint(1, 1440)),
+            )
+            session.add(alert)
+
+        await session.commit()
+        logger.info("Seeded demo data: %d feeds, %d alerts", len(feeds_data), len(alerts_data))
+
+
+# ============================================================================
+# Helper: get alert count per feed
+# ============================================================================
+async def _get_feed_alert_count(db: AsyncSession, feed_id: str) -> int:
+    res = await db.execute(select(func.count(Alert.id)).where(Alert.feed_id == feed_id))
+    return res.scalar_one()
+
+
+async def _get_feed_name(db: AsyncSession, feed_id: str) -> str:
+    res = await db.execute(select(Feed.name).where(Feed.id == feed_id))
+    row = res.first()
+    return row[0] if row else ""
+
+
+# ============================================================================
+# Routes — Root & Health
+# ============================================================================
+@app.get("/", response_model=APIResponse, tags=["System"])
+async def root():
+    """API root — returns service info."""
+    return APIResponse(
+        message="Threat Feeds API is running",
+        data={
+            "name": APP_NAME,
+            "version": APP_VERSION,
+            "debug": DEBUG_MODE,
+            "docs_url": "/docs",
+            "redoc_url": "/redoc",
+            "endpoints": {
+                "dashboard": "/api/v1/dashboard",
+                "feeds": "/api/v1/feeds",
+                "alerts": "/api/v1/alerts",
+                "metrics": "/api/v1/metrics",
+                "stats_severity": "/api/v1/stats/severity",
+                "stats_indicators": "/api/v1/stats/indicator-types",
+                "mock_ingest": "/api/v1/ingest/mock",
+                "collector_status": "/api/v1/collector/status",
+                "collector_trigger": "/api/v1/collector/trigger",
+                "collector_history": "/api/v1/collector/history",
+            },
+        },
+    )
+
+
+@app.get("/health", response_model=APIResponse, tags=["System"])
+async def health(db: AsyncSession = Depends(get_db)):
+    """Health check — verifies database connectivity."""
+    try:
+        await db.execute(select(1))
+        db_ok = True
+    except Exception as exc:
+        logger.exception("Health check DB error: %s", exc)
+        db_ok = False
+    return APIResponse(
+        message="healthy" if db_ok else "degraded",
+        data={
+            "service": APP_NAME,
+            "version": APP_VERSION,
+            "status": "ok" if db_ok else "degraded",
+            "timestamp": now_utc().isoformat(),
+            "database": "connected" if db_ok else "error",
+            "debug": DEBUG_MODE,
+        },
+    )
+
+
+# ============================================================================
+# Routes — Dashboard
+# ============================================================================
+@app.get("/api/v1/dashboard", response_model=APIResponse, tags=["Dashboard"])
+async def dashboard(db: AsyncSession = Depends(get_db)):
+    """Full dashboard data — feeds, alerts, stats, breakdowns."""
+    # Feeds
+    feeds_res = await db.execute(select(Feed).order_by(Feed.created_at.desc()))
+    feeds = feeds_res.scalars().all()
+    total_feeds = len(feeds)
+    active_feeds = sum(1 for f in feeds if f.status == FeedStatus.active)
+    inactive_feeds = total_feeds - active_feeds
+
+    # Alert totals
+    total_alerts = (await db.execute(select(func.count(Alert.id)))).scalar_one()
+    critical_alerts = (await db.execute(select(func.count(Alert.id)).where(Alert.severity == Priority.critical))).scalar_one()
+    high_alerts = (await db.execute(select(func.count(Alert.id)).where(Alert.severity == Priority.high))).scalar_one()
+    medium_alerts = (await db.execute(select(func.count(Alert.id)).where(Alert.severity == Priority.medium))).scalar_one()
+    low_alerts = (await db.execute(select(func.count(Alert.id)).where(Alert.severity == Priority.low))).scalar_one()
+
+    # Severity breakdown
+    severity_breakdown = {
+        "critical": critical_alerts,
+        "high": high_alerts,
+        "medium": medium_alerts,
+        "low": low_alerts,
+    }
+
+    # Indicator type breakdown
+    indicator_types = {}
+    for itype in ["ip", "domain", "url", "hash", "email", "cve", "file"]:
+        cnt = (await db.execute(select(func.count(Alert.id)).where(Alert.indicator_type == itype))).scalar_one()
+        if cnt > 0:
+            indicator_types[itype] = cnt
+
+    # Latest alerts with feed names
+    alerts_res = await db.execute(select(Alert).order_by(Alert.published_at.desc()).limit(10))
+    latest_alerts = alerts_res.scalars().all()
+    alert_outs = []
+    for a in latest_alerts:
+        fname = await _get_feed_name(db, a.feed_id)
+        alert_outs.append(dump_alert(a, feed_name=fname))
+
+    # Recent feeds with alert count
+    feed_outs = []
+    for f in feeds[:5]:
+        cnt = await _get_feed_alert_count(db, f.id)
+        feed_outs.append(dump_feed(f, alert_count=cnt))
+
+    return APIResponse(
+        message="dashboard loaded",
+        data=DashboardOut(
+            total_feeds=total_feeds,
+            active_feeds=active_feeds,
+            inactive_feeds=inactive_feeds,
+            total_alerts=total_alerts,
+            critical_alerts=critical_alerts,
+            high_alerts=high_alerts,
+            medium_alerts=medium_alerts,
+            low_alerts=low_alerts,
+            severity_breakdown=severity_breakdown,
+            indicator_type_breakdown=indicator_types,
+            latest_alerts=alert_outs,
+            recent_feeds=feed_outs,
+        ).model_dump(mode="json"),
+    )
+
+
+# ============================================================================
+# Routes — Feeds CRUD
+# ============================================================================
+@app.get("/api/v1/feeds", response_model=APIResponse, tags=["Feeds"])
+async def list_feeds(
+    db: AsyncSession = Depends(get_db),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    status_filter: Optional[FeedStatus] = Query(None, alias="status"),
+    q: Optional[str] = Query(None, description="Search in feed name"),
+):
+    """List all feeds with pagination and optional filters."""
+    stmt = select(Feed).order_by(Feed.created_at.desc()).offset(skip).limit(limit)
+    if status_filter:
+        stmt = stmt.where(Feed.status == status_filter)
+    if q:
+        stmt = stmt.where(Feed.name.ilike(f"%{q}%"))
+
+    result = await db.execute(stmt)
+    feeds = result.scalars().all()
+
+    feed_outs = []
+    for f in feeds:
+        cnt = await _get_feed_alert_count(db, f.id)
+        feed_outs.append(dump_feed(f, alert_count=cnt).model_dump(mode="json"))
+
+    # Total count (for pagination)
+    count_stmt = select(func.count(Feed.id))
+    if status_filter:
+        count_stmt = count_stmt.where(Feed.status == status_filter)
+    if q:
+        count_stmt = count_stmt.where(Feed.name.ilike(f"%{q}%"))
+    total = (await db.execute(count_stmt)).scalar_one()
+
+    return APIResponse(
+        message="feeds fetched",
+        data=feed_outs,
+        meta={"skip": skip, "limit": limit, "count": len(feeds), "total": total},
+    )
+
+
+@app.post("/api/v1/feeds", response_model=APIResponse, status_code=status.HTTP_201_CREATED, tags=["Feeds"])
+async def create_feed(payload: FeedCreate, db: AsyncSession = Depends(get_db)):
+    """Create a new feed."""
+    existing = await db.execute(select(Feed).where(Feed.source_url == payload.source_url))
+    if existing.scalars().first():
+        raise HTTPException(status_code=409, detail="Feed source_url already exists")
+
+    feed = Feed(
+        name=payload.name,
+        source_url=payload.source_url,
+        description=payload.description,
+        status=FeedStatus.active,
+        last_fetched_at=None,
+    )
+    db.add(feed)
+    await db.commit()
+    await db.refresh(feed)
+    logger.info("Created feed: %s (%s)", feed.name, feed.id)
+    return APIResponse(message="feed created", data=dump_feed(feed).model_dump(mode="json"))
+
+
+@app.get("/api/v1/feeds/{feed_id}", response_model=APIResponse, tags=["Feeds"])
+async def get_feed(feed_id: str, db: AsyncSession = Depends(get_db)):
+    """Get a single feed by ID."""
+    result = await db.execute(select(Feed).where(Feed.id == feed_id))
+    feed = result.scalars().first()
+    if not feed:
+        raise HTTPException(status_code=404, detail="Feed not found")
+    cnt = await _get_feed_alert_count(db, feed.id)
+    return APIResponse(message="feed detail", data=dump_feed(feed, alert_count=cnt).model_dump(mode="json"))
+
+
+@app.patch("/api/v1/feeds/{feed_id}", response_model=APIResponse, tags=["Feeds"])
+async def update_feed(feed_id: str, payload: FeedUpdate, db: AsyncSession = Depends(get_db)):
+    """Update an existing feed."""
+    result = await db.execute(select(Feed).where(Feed.id == feed_id))
+    feed = result.scalars().first()
+    if not feed:
+        raise HTTPException(status_code=404, detail="Feed not found")
+
+    if payload.name is not None:
+        feed.name = payload.name
+    if payload.source_url is not None:
+        feed.source_url = payload.source_url
+    if payload.description is not None:
+        feed.description = payload.description
+    if payload.status is not None:
+        feed.status = payload.status
+
+    feed.updated_at = now_utc()
+    await db.commit()
+    await db.refresh(feed)
+    cnt = await _get_feed_alert_count(db, feed.id)
+    logger.info("Updated feed: %s (%s)", feed.name, feed.id)
+    return APIResponse(message="feed updated", data=dump_feed(feed, alert_count=cnt).model_dump(mode="json"))
+
+
+@app.delete("/api/v1/feeds/{feed_id}", response_model=APIResponse, tags=["Feeds"])
+async def delete_feed(feed_id: str, db: AsyncSession = Depends(get_db)):
+    """Delete a feed and all its alerts."""
+    result = await db.execute(select(Feed).where(Feed.id == feed_id))
+    feed = result.scalars().first()
+    if not feed:
+        raise HTTPException(status_code=404, detail="Feed not found")
+    feed_name = feed.name
+    await db.delete(feed)
+    await db.commit()
+    logger.info("Deleted feed: %s (%s)", feed_name, feed_id)
+    return APIResponse(message="feed deleted", data={"feed_id": feed_id, "name": feed_name})
+
+
+# ============================================================================
+# Routes — Alerts CRUD
+# ============================================================================
+@app.get("/api/v1/alerts", response_model=APIResponse, tags=["Alerts"])
+async def list_alerts(
+    db: AsyncSession = Depends(get_db),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    severity: Optional[Priority] = Query(None),
+    indicator_type: Optional[str] = Query(None),
+    feed_id: Optional[str] = Query(None),
+    q: Optional[str] = Query(None, description="Search in title / indicator_value"),
+):
+    """List alerts with pagination and filters."""
+    stmt = select(Alert).order_by(Alert.published_at.desc()).offset(skip).limit(limit)
+    if severity:
+        stmt = stmt.where(Alert.severity == severity)
+    if indicator_type:
+        stmt = stmt.where(Alert.indicator_type == indicator_type)
+    if feed_id:
+        stmt = stmt.where(Alert.feed_id == feed_id)
+    if q:
+        like = f"%{q}%"
+        stmt = stmt.where((Alert.title.ilike(like)) | (Alert.indicator_value.ilike(like)))
+
+    result = await db.execute(stmt)
+    alerts = result.scalars().all()
+
+    alert_outs = []
+    for a in alerts:
+        fname = await _get_feed_name(db, a.feed_id)
+        alert_outs.append(dump_alert(a, feed_name=fname).model_dump(mode="json"))
+
+    # Total count
+    count_stmt = select(func.count(Alert.id))
+    if severity:
+        count_stmt = count_stmt.where(Alert.severity == severity)
+    if indicator_type:
+        count_stmt = count_stmt.where(Alert.indicator_type == indicator_type)
+    if feed_id:
+        count_stmt = count_stmt.where(Alert.feed_id == feed_id)
+    if q:
+        like = f"%{q}%"
+        count_stmt = count_stmt.where((Alert.title.ilike(like)) | (Alert.indicator_value.ilike(like)))
+    total = (await db.execute(count_stmt)).scalar_one()
+
+    return APIResponse(
+        message="alerts fetched",
+        data=alert_outs,
+        meta={"skip": skip, "limit": limit, "count": len(alerts), "total": total},
+    )
+
+
+@app.get("/api/v1/alerts/{alert_id}", response_model=APIResponse, tags=["Alerts"])
+async def get_alert(alert_id: str, db: AsyncSession = Depends(get_db)):
+    """Get a single alert by ID."""
+    result = await db.execute(select(Alert).where(Alert.id == alert_id))
+    alert = result.scalars().first()
+    if not alert:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    fname = await _get_feed_name(db, alert.feed_id)
+    return APIResponse(message="alert detail", data=dump_alert(alert, feed_name=fname).model_dump(mode="json"))
+
+
+@app.post("/api/v1/alerts", response_model=APIResponse, status_code=status.HTTP_201_CREATED, tags=["Alerts"])
+async def create_alert(payload: AlertCreate, db: AsyncSession = Depends(get_db)):
+    """Create a new alert."""
+    feed_result = await db.execute(select(Feed).where(Feed.id == payload.feed_id))
+    feed = feed_result.scalars().first()
+    if not feed:
+        raise HTTPException(status_code=404, detail="Feed not found")
+
+    alert = Alert(
+        feed_id=payload.feed_id,
+        title=payload.title,
+        description=payload.description,
+        indicator_type=payload.indicator_type,
+        indicator_value=payload.indicator_value,
+        severity=payload.severity,
+        confidence=payload.confidence,
+        tags=json.dumps(payload.tags, ensure_ascii=False),
+        published_at=now_utc(),
+    )
+    db.add(alert)
+    feed.last_fetched_at = now_utc()
+    feed.updated_at = now_utc()
+    await db.commit()
+    await db.refresh(alert)
+    logger.info("Created alert: %s (%s) for feed %s", alert.title, alert.id, feed.name)
+    return APIResponse(message="alert created", data=dump_alert(alert, feed_name=feed.name).model_dump(mode="json"))
+
+
+@app.patch("/api/v1/alerts/{alert_id}", response_model=APIResponse, tags=["Alerts"])
+async def update_alert(alert_id: str, payload: AlertUpdate, db: AsyncSession = Depends(get_db)):
+    """Update an existing alert."""
+    result = await db.execute(select(Alert).where(Alert.id == alert_id))
+    alert = result.scalars().first()
+    if not alert:
+        raise HTTPException(status_code=404, detail="Alert not found")
+
+    if payload.title is not None:
+        alert.title = payload.title
+    if payload.description is not None:
+        alert.description = payload.description
+    if payload.severity is not None:
+        alert.severity = payload.severity
+    if payload.confidence is not None:
+        alert.confidence = payload.confidence
+    if payload.tags is not None:
+        alert.tags = json.dumps(payload.tags, ensure_ascii=False)
+
+    await db.commit()
+    await db.refresh(alert)
+    fname = await _get_feed_name(db, alert.feed_id)
+    logger.info("Updated alert: %s (%s)", alert.title, alert.id)
+    return APIResponse(message="alert updated", data=dump_alert(alert, feed_name=fname).model_dump(mode="json"))
+
+
+@app.delete("/api/v1/alerts/{alert_id}", response_model=APIResponse, tags=["Alerts"])
+async def delete_alert(alert_id: str, db: AsyncSession = Depends(get_db)):
+    """Delete an alert."""
+    result = await db.execute(select(Alert).where(Alert.id == alert_id))
+    alert = result.scalars().first()
+    if not alert:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    alert_title = alert.title
+    await db.delete(alert)
+    await db.commit()
+    logger.info("Deleted alert: %s (%s)", alert_title, alert_id)
+    return APIResponse(message="alert deleted", data={"alert_id": alert_id, "title": alert_title})
+
+
+# ============================================================================
+# Routes — Stats & Metrics
+# ============================================================================
+@app.get("/api/v1/metrics", response_model=APIResponse, tags=["Stats"])
+async def metrics(db: AsyncSession = Depends(get_db)):
+    """General metrics overview."""
+    feed_count = (await db.execute(select(func.count(Feed.id)))).scalar_one()
+    active_feed_count = (await db.execute(select(func.count(Feed.id)).where(Feed.status == FeedStatus.active))).scalar_one()
+    alert_count = (await db.execute(select(func.count(Alert.id)))).scalar_one()
+    critical_count = (await db.execute(select(func.count(Alert.id)).where(Alert.severity == Priority.critical))).scalar_one()
+    high_count = (await db.execute(select(func.count(Alert.id)).where(Alert.severity == Priority.high))).scalar_one()
+    return APIResponse(
+        message="metrics",
+        data={
+            "feeds": feed_count,
+            "active_feeds": active_feed_count,
+            "alerts": alert_count,
+            "critical_alerts": critical_count,
+            "high_alerts": high_count,
+            "timestamp": now_utc().isoformat(),
+        },
+    )
+
+
+@app.get("/api/v1/stats/severity", response_model=APIResponse, tags=["Stats"])
+async def stats_severity(db: AsyncSession = Depends(get_db)):
+    """Alert count grouped by severity — useful for pie/bar charts."""
+    critical = (await db.execute(select(func.count(Alert.id)).where(Alert.severity == Priority.critical))).scalar_one()
+    high = (await db.execute(select(func.count(Alert.id)).where(Alert.severity == Priority.high))).scalar_one()
+    medium = (await db.execute(select(func.count(Alert.id)).where(Alert.severity == Priority.medium))).scalar_one()
+    low = (await db.execute(select(func.count(Alert.id)).where(Alert.severity == Priority.low))).scalar_one()
+    total = critical + high + medium + low
+
+    return APIResponse(
+        message="severity stats",
+        data=SeverityStatsOut(
+            critical=critical,
+            high=high,
+            medium=medium,
+            low=low,
+            total=total,
+        ).model_dump(),
+    )
+
+
+@app.get("/api/v1/stats/indicator-types", response_model=APIResponse, tags=["Stats"])
+async def stats_indicator_types(db: AsyncSession = Depends(get_db)):
+    """Alert count grouped by indicator type — useful for charts."""
+    stats: dict[str, int] = {}
+    total = 0
+    for itype in ["ip", "domain", "url", "hash", "email", "cve", "file"]:
+        cnt = (await db.execute(select(func.count(Alert.id)).where(Alert.indicator_type == itype))).scalar_one()
+        stats[itype] = cnt
+        total += cnt
+
+    return APIResponse(
+        message="indicator type stats",
+        data=IndicatorTypeStatsOut(stats=stats, total=total).model_dump(),
+    )
+
+
+# ============================================================================
+# Routes — Mock Ingest (Debug)
+# ============================================================================
+@app.post("/api/v1/ingest/mock", response_model=APIResponse, tags=["Debug"])
+async def ingest_mock(db: AsyncSession = Depends(get_db)):
+    """Debug endpoint — simulates an ingest cycle, creates one alert per active feed."""
+    feeds_res = await db.execute(select(Feed).where(Feed.status == FeedStatus.active))
+    feeds = feeds_res.scalars().all()
+
+    created: list[dict[str, Any]] = []
+    severity_choices = [Priority.low, Priority.medium, Priority.high, Priority.critical]
+    type_choices = ["ip", "domain", "url", "hash", "email", "cve", "file"]
+
+    for feed in feeds:
+        sev = random.choice(severity_choices)
+        itype = random.choice(type_choices)
+        alert = Alert(
+            feed_id=feed.id,
+            title=f"[Mock] {sev.value.upper()} {itype} alert from {feed.name}",
+            description=f"Auto-generated alert for frontend testing at {now_utc().isoformat()}",
+            indicator_type=itype,
+            indicator_value=f"mock-{itype}-{uuid4().hex[:8]}.example.com",
+            severity=sev,
+            confidence=round(random.uniform(0.3, 1.0), 2),
+            tags=json.dumps(["demo", "mock-ingest", itype]),
+            published_at=now_utc(),
+        )
+        feed.last_fetched_at = now_utc()
+        feed.updated_at = now_utc()
+        db.add(alert)
+        created.append({
+            "feed_id": feed.id,
+            "feed_name": feed.name,
+            "alert_title": alert.title,
+            "severity": sev.value,
+            "indicator_type": itype,
+        })
+
+    await db.commit()
+    logger.info("Mock ingest completed: created %d alerts", len(created))
+    return APIResponse(
+        message="mock ingest completed",
+        data={"created": created, "count": len(created)},
+    )
+
+
+@app.post("/api/v1/reset", response_model=APIResponse, tags=["Debug"])
+async def reset_database(db: AsyncSession = Depends(get_db)):
+    """Debug endpoint — drops all data and re-seeds demo data."""
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+        await conn.run_sync(Base.metadata.create_all)
+    await seed_demo_data()
+    logger.info("Database reset and re-seeded")
+    return APIResponse(message="database reset and re-seeded")
+
+
+# ============================================================================
+# Routes — Collector Management
+# ============================================================================
+@app.get("/api/v1/collector/status", response_model=APIResponse, tags=["Collector"])
+async def collector_status():
+    """Get current collector scheduler status — running, last run, next run."""
+    if collector_scheduler is None:
+        return APIResponse(
+            message="collector not initialized",
+            data={"enabled": False, "running": False},
+        )
+    return APIResponse(
+        message="collector status",
+        data=collector_scheduler.get_status(),
+    )
+
+
+@app.post("/api/v1/collector/trigger", response_model=APIResponse, tags=["Collector"])
+async def collector_trigger():
+    """Manually trigger a collection cycle — runs all collectors immediately."""
+    if collector_scheduler is None:
+        raise HTTPException(status_code=503, detail="Collector not initialized")
+
+    logger.info("Manual collection trigger via API")
+    summaries = await collector_scheduler.run_all_collectors()
+
+    total_new = sum(s.get("indicators_new", 0) for s in summaries)
+    total_dupes = sum(s.get("indicators_duplicate", 0) for s in summaries)
+    total_errors = sum(1 for s in summaries if not s.get("success", False))
+
+    return APIResponse(
+        message=f"Collection completed: {total_new} new, {total_dupes} duplicates, {total_errors} errors",
+        data={
+            "summaries": summaries,
+            "totals": {
+                "new": total_new,
+                "duplicates": total_dupes,
+                "errors": total_errors,
+            },
+        },
+    )
+
+
+@app.get("/api/v1/collector/history", response_model=APIResponse, tags=["Collector"])
+async def collector_history():
+    """Get last collection cycle results."""
+    if collector_scheduler is None:
+        return APIResponse(
+            message="collector not initialized",
+            data=[],
+        )
+    return APIResponse(
+        message="last collection results",
+        data={
+            "run_count": collector_scheduler.run_count,
+            "last_run": collector_scheduler.last_run.isoformat() if collector_scheduler.last_run else None,
+            "results": collector_scheduler.last_results,
+        },
+    )
+
+
+# ============================================================================
+# Debug / Local Runner
+# ============================================================================
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.getenv("PORT", "8000"))
+    logger.info("Starting uvicorn on port %d ...", port)
+    uvicorn.run(
+        "threatfeeds_backend:app",
+        host="0.0.0.0",
+        port=port,
+        reload=DEBUG_MODE,
+        log_level="debug" if DEBUG_MODE else "info",
+    )

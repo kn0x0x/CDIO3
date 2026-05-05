@@ -1,0 +1,41 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: threatshield-backend
+    ports:
+      - "8000:8000"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8000
+      DEBUG: ${DEBUG:-1}
+      DATABASE_PATH: /app/storage/threatfeeds.db
+      CORS_ORIGINS: "*"
+      SEED_ALERT_COUNT: ${SEED_ALERT_COUNT:-916}
+      COLLECTOR_ENABLED: ${COLLECTOR_ENABLED:-1}
+      COLLECTOR_INTERVAL_MINUTES: ${COLLECTOR_INTERVAL_MINUTES:-30}
+      REMOTE_FEEDS_ENABLED: ${REMOTE_FEEDS_ENABLED:-0}
+      FEED_REQUEST_TIMEOUT: ${FEED_REQUEST_TIMEOUT:-3}
+      ALERT_THRESHOLD: ${ALERT_THRESHOLD:-80}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+    volumes:
+      - backend-data:/app/storage
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:8000}
+    container_name: threatshield-frontend
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  backend-data:
