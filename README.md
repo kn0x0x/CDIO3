@@ -324,6 +324,3 @@ curl -X POST http://localhost:8000/api/v1/reset
 
 Hoặc trong frontend vào **Cài đặt** → **Reset database demo**.
 
-
-## Ghi chú bản giao nộp
-Phiên bản `ThreatShield-CDIO_NoLogin` đã lược bỏ cơ chế đăng nhập/đăng ký ở frontend để phục vụ demo trực tiếp, giảm thao tác trình diễn. Dashboard được truy cập thẳng tại `/`.
