@@ -7,6 +7,7 @@ Source này đã được hoàn thiện lại thành một bộ chạy demo đ�
 - **Backend FastAPI**: collector, chuẩn hóa IoC, dedup, enrichment, risk scoring, MITRE ATT&CK mapping, API dashboard, export CSV, Telegram alert.
 - **Data Analysis + ML**: thống kê severity/type/feed/country/timeline, heatmap, attack vector, mô hình scikit-learn dự đoán tactic, confusion matrix, train/evaluate/predict endpoint.
 - **Frontend React**: login/register/forgot password, overview, map Leaflet, analytics Recharts, threats list + filter/export, feeds CRUD, activity, settings/demo controls.
+<img width="1477" height="754" alt="Screenshot 2026-05-05 at 11 00 49" src="https://github.com/user-attachments/assets/708436ea-f1bc-474e-8a91-2250c242c2a7" />
 
 ---
 ## 2. Cấu trúc chính
@@ -267,6 +268,9 @@ curl -L http://localhost:8000/api/v1/export/alerts.csv -o threatshield-alerts.cs
 | Collector | `GET/POST /api/v1/collector/*` | Status, trigger, history |
 | Telegram | `POST /api/v1/telegram/test` | Test gửi bot |
 | Export | `GET /api/v1/export/alerts.csv` | Xuất CSV |
+<img width="760" height="532" alt="Screenshot 2026-05-05 at 11 02 49" src="https://github.com/user-attachments/assets/c2c83f56-657a-4004-b7f7-ae350e3c212a" />
+<img width="751" height="747" alt="Screenshot 2026-05-05 at 11 03 08" src="https://github.com/user-attachments/assets/9c4d5e17-52e0-429e-8e38-e38e014f9a34" />
+
 
 ---
 
