@@ -166,7 +166,7 @@ Restart backend. Vào frontend `/settings`, bấm **Gửi test Telegram**. Backe
 
 ---
 
-## 7. Demo nhanh trước khi nộp
+## 7. Demo nhanh
 
 ### 7.1. Test backend bằng script
 
